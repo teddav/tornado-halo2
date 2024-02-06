@@ -1,51 +1,50 @@
 use halo2_proofs::{
-    arithmetic::Field,
-    circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Instance, Selector},
+    circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
+    // arithmetic::Field,
+    halo2curves::ff::PrimeField,
+    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector},
     poly::Rotation,
 };
 use std::marker::PhantomData;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct HashConfig {
-    advice: [Column<Advice>; 2],
+    advice: [Column<Advice>; 3],
     instance: Column<Instance>,
     hash_selector: Selector,
 }
 
-struct HashChip<F: Field> {
+pub struct HashChip<F> {
     config: HashConfig,
     _marker: PhantomData<F>,
 }
 
-impl<F: Field> HashChip<F> {
-    fn construct(config: HashConfig) -> Self {
-        println!("chip construct");
-
+impl<F: PrimeField> HashChip<F> {
+    pub fn construct(config: HashConfig) -> Self {
         Self {
             config,
             _marker: PhantomData,
         }
     }
 
-    fn configure(
+    pub fn configure(
         meta: &mut ConstraintSystem<F>,
-        advice: [Column<Advice>; 2],
+        advice: [Column<Advice>; 3],
         instance: Column<Instance>,
     ) -> HashConfig {
-        println!("chip config");
-
         let hash_selector = meta.selector();
 
         meta.enable_equality(advice[0]);
         meta.enable_equality(advice[1]);
+        meta.enable_equality(advice[2]);
         meta.enable_equality(instance);
 
-        meta.create_gate("hash", |meta| {
+        meta.create_gate("hash constraint", |meta| {
             let s = meta.query_selector(hash_selector);
-            let n = meta.query_advice(advice[0], Rotation::cur());
-            let hashed_value = meta.query_advice(advice[1], Rotation::cur());
-            vec![s * (n.clone() * n - hashed_value)]
+            let a = meta.query_advice(advice[0], Rotation::cur());
+            let b = meta.query_advice(advice[1], Rotation::cur());
+            let hash_result = meta.query_advice(advice[2], Rotation::cur());
+            vec![s * (a * b - hash_result)]
         });
 
         HashConfig {
@@ -54,14 +53,51 @@ impl<F: Field> HashChip<F> {
             hash_selector,
         }
     }
+
+    pub fn hash(
+        &self,
+        mut layouter: impl Layouter<F>,
+        left_cell: AssignedCell<F, F>,
+        right_cell: AssignedCell<F, F>,
+    ) -> Result<AssignedCell<F, F>, Error> {
+        layouter.assign_region(
+            || "hash row",
+            |mut region| {
+                self.config.hash_selector.enable(&mut region, 0)?;
+
+                left_cell.copy_advice(
+                    || "copy left input",
+                    &mut region,
+                    self.config.advice[0],
+                    0,
+                )?;
+                right_cell.copy_advice(
+                    || "copy right input",
+                    &mut region,
+                    self.config.advice[1],
+                    0,
+                )?;
+
+                let hash_result_cell = region.assign_advice(
+                    || "output",
+                    self.config.advice[2],
+                    0,
+                    || left_cell.value().cloned() * right_cell.value().cloned(),
+                )?;
+
+                Ok(hash_result_cell)
+            },
+        )
+    }
 }
 
 #[derive(Debug, Default)]
-pub struct HashCircuit<F: Field> {
-    pub n: Value<F>,
+pub struct HashCircuit<F> {
+    pub a: Value<F>,
+    pub b: Value<F>,
 }
 
-impl<F: Field> Circuit<F> for HashCircuit<F> {
+impl<F: PrimeField> Circuit<F> for HashCircuit<F> {
     type Config = HashConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
@@ -70,8 +106,11 @@ impl<F: Field> Circuit<F> for HashCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        println!("circuit config");
-        let advice = [meta.advice_column(), meta.advice_column()];
+        let advice = [
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+        ];
         let instance = meta.instance_column();
         HashChip::configure(meta, advice, instance)
     }
@@ -81,21 +120,29 @@ impl<F: Field> Circuit<F> for HashCircuit<F> {
         config: Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), halo2_proofs::plonk::Error> {
-        println!("circuit synthesize");
-        // let chip = HashChip::construct(config);
-
-        let output_hash_value_cell = layouter.assign_region(
-            || "hash preimage",
+        let (left, right) = layouter.assign_region(
+            || "private inputs",
             |mut region| {
-                config.hash_selector.enable(&mut region, 0)?;
-                region.assign_advice(|| "private input", config.advice[0], 0, || self.n)?;
-                let output_hash_value_cell =
-                    region.assign_advice(|| "output", config.advice[1], 0, || self.n * self.n)?;
-                Ok(output_hash_value_cell)
+                let left = region.assign_advice(
+                    || "private input left",
+                    config.advice[0],
+                    0,
+                    || self.a,
+                )?;
+                let right = region.assign_advice(
+                    || "private input right",
+                    config.advice[1],
+                    0,
+                    || self.b,
+                )?;
+                Ok((left, right))
             },
         )?;
 
-        layouter.constrain_instance(output_hash_value_cell.cell(), config.instance, 0)
+        let chip = HashChip::construct(config);
+        let hash_result_cell = chip.hash(layouter.namespace(|| "hasher"), left, right)?;
+
+        layouter.constrain_instance(hash_result_cell.cell(), config.instance, 0)
     }
 }
 
@@ -106,15 +153,18 @@ mod tests {
 
     #[test]
     fn test_hash_circuit() {
-        let n = 12;
+        let a = 11;
+        let b = 7;
+
         let circuit = HashCircuit {
-            n: Value::known(Fp::from(n)),
+            a: Value::known(Fp::from(a)),
+            b: Value::known(Fp::from(b)),
         };
-        let public_inputs = vec![Fp::from(n * n)];
+        let public_inputs = vec![Fp::from(a * b)];
         let prover = MockProver::run(4, &circuit, vec![public_inputs.clone()]).unwrap();
         assert!(prover.verify().is_ok());
 
-        let public_inputs2 = vec![Fp::from(n * n * n)];
+        let public_inputs2 = vec![Fp::from(a * b + 1)];
         let prover2 = MockProver::run(4, &circuit, vec![public_inputs2.clone()]).unwrap();
         assert!(prover2.verify().is_err());
     }
