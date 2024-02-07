@@ -1,6 +1,6 @@
 use crate::chips::merkle::{MerkleChip, MerkleConfig};
 use halo2_proofs::{
-    circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
+    circuit::{Layouter, SimpleFloorPlanner, Value},
     halo2curves::ff::PrimeField,
     plonk::{Circuit, ConstraintSystem},
 };
@@ -42,17 +42,13 @@ impl<F: PrimeField> Circuit<F> for MerkleCircuit<F> {
         layouter.constrain_instance(leaf_cell.cell(), config.clone().instance, 0)?;
 
         let chip = MerkleChip::construct(config.clone());
-        let mut digest: AssignedCell<F, F> = leaf_cell;
-        for i in 0..self.path_elements.len() {
-            digest = chip.merkle_prove(
-                layouter.namespace(|| "prove tree"),
-                &digest,
-                self.path_elements[i],
-                self.path_indices[i],
-            )?;
-        }
-
-        layouter.constrain_instance(digest.cell(), config.instance, 1)?;
+        let root_cell = chip.prove_tree_root(
+            layouter.namespace(|| "prove tree"),
+            leaf_cell,
+            self.path_elements.clone(),
+            self.path_indices.clone(),
+        )?;
+        layouter.constrain_instance(root_cell.cell(), config.instance, 1)?;
 
         Ok(())
     }
@@ -60,9 +56,8 @@ impl<F: PrimeField> Circuit<F> for MerkleCircuit<F> {
 
 #[cfg(test)]
 mod tests {
-    use halo2_proofs::{circuit::Value, dev::MockProver, halo2curves::pasta::Fp};
-
     use super::MerkleCircuit;
+    use halo2_proofs::{circuit::Value, dev::MockProver, halo2curves::pasta::Fp};
 
     #[test]
     fn test_merkle_circuit() {

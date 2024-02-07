@@ -16,7 +16,7 @@ pub struct MerkleConfig {
     pub hash_config: HashConfig,
 }
 
-pub struct MerkleChip<F: PrimeField> {
+pub struct MerkleChip<F> {
     pub config: MerkleConfig,
     _marker: PhantomData<F>,
 }
@@ -81,7 +81,7 @@ impl<F: PrimeField> MerkleChip<F> {
         }
     }
 
-    pub fn merkle_prove(
+    pub fn merkle_prove_layer(
         &self,
         mut layouter: impl Layouter<F>,
         node_cell: &AssignedCell<F, F>,
@@ -138,5 +138,24 @@ impl<F: PrimeField> MerkleChip<F> {
         let hash_chip = HashChip::construct(self.config.hash_config);
         let result_hash_cell = hash_chip.hash(layouter.namespace(|| "hash row"), left, right)?;
         Ok(result_hash_cell)
+    }
+
+    pub fn prove_tree_root(
+        &self,
+        mut layouter: impl Layouter<F>,
+        leaf: AssignedCell<F, F>,
+        path_elements: Vec<Value<F>>,
+        path_indices: Vec<Value<F>>,
+    ) -> Result<AssignedCell<F, F>, Error> {
+        let mut digest: AssignedCell<F, F> = leaf;
+        for i in 0..path_elements.len() {
+            digest = self.merkle_prove_layer(
+                layouter.namespace(|| "prove tree"),
+                &digest,
+                path_elements[i],
+                path_indices[i],
+            )?;
+        }
+        Ok(digest)
     }
 }
